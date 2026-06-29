@@ -1,9 +1,10 @@
 import json
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.redis_client import get_redis_client
 
+
+CACHE_TTL_SECONDS = 3600
 
 POPULAR_SEARCHES: List[Tuple[str, str, str]] = [
     ("NYC", "LON", "2024-10-01"),
@@ -12,50 +13,40 @@ POPULAR_SEARCHES: List[Tuple[str, str, str]] = [
 ]
 
 
-def _build_search_prefix(origin: str, destination: str, date: str) -> str:
-    prefix = f"flights_search:{origin}:{destination}:{date}:"
-    return prefix
+def _build_search_key(origin: str, destination: str, date: str) -> str:
+    return f"flights_search:{origin}:{destination}:{date}"
 
 
 def get_cached_search_results(origin: str, destination: str, date: str) -> Optional[List[Dict[str, Any]]]:
     client = get_redis_client()
-    prefix = _build_search_prefix(origin, destination, date)
-    cursor = 0
-    found_key = None
-    while True:
-        cursor, keys = client.scan(cursor=cursor, match=prefix + "*", count=50)
-        if keys:
-            found_key = keys[0]
-            break
-        if cursor == 0:
-            break
-    if not found_key:
-        return None
-    raw = client.get(found_key)
+    key = _build_search_key(origin, destination, date)
+    raw = client.get(key)
     if raw is None:
         return None
-    data = json.loads(raw.decode("utf-8"))
-    return data
+    return json.loads(raw)
 
 
 def set_cached_search_results(origin: str, destination: str, date: str, results: List[Dict[str, Any]]) -> None:
     client = get_redis_client()
-    prefix = _build_search_prefix(origin, destination, date)
-    suffix = str(int(time.time()))
-    key = prefix + suffix
+    key = _build_search_key(origin, destination, date)
     value = json.dumps(results)
-    client.set(key, value)
+    client.set(key, value, ex=CACHE_TTL_SECONDS)
 
 
 def prewarm_popular_searches() -> None:
     from app.models.models import search_flights
 
+    client = get_redis_client()
+    pipe = client.pipeline()
     for origin, destination, date in POPULAR_SEARCHES:
-        existing = get_cached_search_results(origin, destination, date)
-        if existing is None:
+        key = _build_search_key(origin, destination, date)
+        existing = client.exists(key)
+        if not existing:
             results = search_flights(origin, destination, date)
             as_dict = [flight.dict() for flight in results]
-            set_cached_search_results(origin, destination, date, as_dict)
+            value = json.dumps(as_dict)
+            pipe.set(key, value, ex=CACHE_TTL_SECONDS)
+    pipe.execute()
 
 
 PRICE_ALERTS_KEY = "price_alerts"
@@ -63,20 +54,13 @@ PRICE_ALERTS_KEY = "price_alerts"
 
 def get_all_price_alerts() -> List[Dict[str, Any]]:
     client = get_redis_client()
-    raw = client.get(PRICE_ALERTS_KEY)
-    if raw is None:
+    raw_list = client.lrange(PRICE_ALERTS_KEY, 0, -1)
+    if not raw_list:
         return []
-    alerts = json.loads(raw.decode("utf-8"))
-    return alerts
+    return [json.loads(item) for item in raw_list]
 
 
 def add_price_alert(alert: Dict[str, Any]) -> None:
     client = get_redis_client()
-    raw = client.get(PRICE_ALERTS_KEY)
-    if raw is None:
-        alerts: List[Dict[str, Any]] = []
-    else:
-        alerts = json.loads(raw.decode("utf-8"))
-    alerts.append(alert)
-    serialized = json.dumps(alerts)
-    client.set(PRICE_ALERTS_KEY, serialized)
+    serialized = json.dumps(alert)
+    client.rpush(PRICE_ALERTS_KEY, serialized)
